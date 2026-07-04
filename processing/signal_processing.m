@@ -2,94 +2,113 @@ function [processed_data, processing_metadata] = signal_processing(rx_data, tx_s
 % SIGNAL_PROCESSING Perform Multi-Channel Matched Filtering and TVG Compensation.
 %
 % File        : signal_processing.m
-% Purpose     : Phase 2 Signal Conditioning Core
-% Author      : Central Coordinator AI (Gemini)
+% Purpose     : Phase 2 Signal Conditioning Core (Final Pipeline Integrated)
+% Author      : Central Coordinator AI
 %
 % Inputs:
-%   rx_data    - [NumSamples x N] complex-valued baseband raw acoustic matrix
-%   tx_signal  - [NumChirpSamples x 1] vector representing reference transmitted waveform
-%   config     - Struct containing fields: Fs, c, alpha, window_type (optional)
+%   rx_data    - Struct containing simulation fields OR raw [NumSamples x N] matrix
+%   tx_signal  - Vector representing reference transmitted waveform
+%   config     - Struct containing system configuration parameters
 %
 % Outputs:
 %   processed_data      - [NumSamples x N] range-compressed, gain-equalized matrix
 %   processing_metadata - Struct returning applied gains and calculation logs
 
 % =========================================================================
-% 1. VALIDATION AND PARAMETER EXTRACTION
+% 0. DEFENSIVE STRUCT DETECTION & FIELD UNWRAPPING
 % =========================================================================
-[NumSamples, N] = size(rx_data);
-Fs = config.Fs;
-
-if isfield(config, 'c')
-    c = config.c;
+if isstruct(rx_data)
+    % Map to the verified field from the simulation's structural bundle
+    if isfield(rx_data, 'signal')
+        rx_matrix = rx_data.signal;
+    elseif isfield(rx_data, 'sensor_data')
+        rx_matrix = rx_data.sensor_data;
+    elseif isfield(rx_data, 'data')
+        rx_matrix = rx_data.data;
+    else
+        fields = fieldnames(rx_data);
+        error('SignalProcessing:InvalidStruct', ...
+            'rx_data was passed as a struct, but no valid data field was found. Available fields: %s', ...
+            strjoin(fields, ', '));
+    end
 else
-    c = 1500; % Fallback speed of sound in m/s
+    % rx_data is already a standard numeric matrix
+    rx_matrix = rx_data;
 end
 
-if isfield(config, 'alpha')
-    alpha = config.alpha;
-else
-    alpha = 0.11; % Fallback absorption coefficient in dB/km (Thorpe default)
+% Ensure arrays are evaluated correctly using the extracted matrix
+[NumSamples, N] = size(rx_matrix);
+
+% =========================================================================
+% 1. CASE-INSENSITIVE PARAMETER EXTRACTION GATEWAY
+% =========================================================================
+if isfield(config, 'Fs'),          Fs = config.Fs;
+elseif isfield(config, 'fs'),      Fs = config.fs;
+elseif isfield(config, 'SampleRate'), Fs = config.SampleRate;
+else, error('SignalProcessing:MissingFs', 'Configuration missing sampling rate (Fs).');
 end
 
-% Create unambiguous time vector
+if isfield(config, 'c'), c = config.c; else, c = 1500; end
+if isfield(config, 'alpha'), alpha = config.alpha; else, alpha = 0.11; end
+
+if isfield(config, 'T'),          pulse_duration = config.T;
+elseif isfield(config, 't_pulse'), pulse_duration = config.t_pulse;
+else, pulse_duration = 0.01; 
+end
+
 time_vector = (0:NumSamples-1).' / Fs; 
 
 % =========================================================================
-% 2. PIECEWISE TIME-VARYING GAIN (TVG) EQUALIZATION
+% 2. TIME-VARYING GAIN (TVG) EQUALIZATION
 % =========================================================================
-% Convert two-way time of flight to one-way range (meters)
 ranges = (c * time_vector) / 2;
-
-% Apply a tiny epsilon offset to prevent log10(0) singularities at range = 0
 ranges(ranges < eps) = eps; 
 
-% Calculate exact Two-Way Transmission Loss: TL = 2 * [20*log10(R) + alpha * R_km]
-% Distributed linearly: G_dB = 40*log10(R) + 2 * alpha * (R / 1000)
 G_dB = 40 * log10(ranges) + 2 * alpha * (ranges / 1000);
 
-% Define Piecewise TVG limits (Blanking window & saturation ceiling)
-t0 = isfield(config, 'T') * config.T; % Use pulse width as standard blanking window
-if isempty(t0) || t0 == 0, t0 = 0.002; end % Fallback to 2ms
-
-% Apply Clamping Limits
-G_dB(time_vector < t0) = G_dB(find(time_vector >= t0, 1, 'first')); 
-
-% Convert to linear voltage/pressure multiplier
-gain_vector = 10 .^ (G_dB / 20); 
-
-% Apply TVG across all N columns using implicit matrix expansion
-tvg_scaled_data = rx_data .* gain_vector;
-
-% =========================================================================
-% 3. FFT-BASED FREQUENCY DOMAIN MATCHED FILTERING
-% =========================================================================
-% Match FFT execution block to the exact dimensions of incoming matrix row count
-N_fft = NumSamples; 
-
-% Prepare reference chirp vector
-tx_len = length(tx_signal);
-replica = zeros(N_fft, 1);
-replica(1:tx_len) = tx_signal;
-
-% Optional Frequency-Domain Windowing to control Peak Sidelobe Levels (PSLL)
-if isfield(config, 'window_type') && strcmpi(config, 'window_type', 'Hamming')
-    win = hamming(tx_len);
-    replica(1:tx_len) = replica(1:tx_len) .* win;
+clamp_idx = find(time_vector >= pulse_duration, 1, 'first');
+if ~isempty(clamp_idx)
+    target_gain_scalar = G_dB(clamp_idx);
+    blank_mask = time_vector < pulse_duration;
+    G_dB(blank_mask) = target_gain_scalar;
+else
+    G_dB(:) = 0;
 end
 
-% Compute fast-time 1D Fourier Transform of input signal channels and template
+gain_vector = 10 .^ (G_dB / 20); 
+
+% Multiply using the raw numeric extracted matrix array
+tvg_scaled_data = rx_matrix .* gain_vector;
+
+% =========================================================================
+% 3. FFT MATCHED FILTERING / PULSE COMPRESSION
+% =========================================================================
+N_fft = NumSamples; 
+
+tx_signal = tx_signal(:);
+tx_len = length(tx_signal);
+
+replica = zeros(N_fft, 1);
+if tx_len <= N_fft
+    replica(1:tx_len) = tx_signal;
+else
+    replica = tx_signal(1:N_fft);
+end
+
+if isfield(config, 'window_type') && strcmpi(config.window_type, 'Hamming')
+    win = hamming(min(tx_len, N_fft));
+    replica(1:length(win)) = replica(1:length(win)) .* win;
+end
+
 X_rx = fft(tvg_scaled_data, N_fft, 1);
 H_ref = fft(replica, N_fft);
 
-% Apply Conjugate Spectral Multiplication (Matched Filter Identity: H(f) = S*(f))
-% Utilizing implicit expansion across all N channels
 Compressed_Spectrum = X_rx .* conj(H_ref);
-
-% Revert to Time-Domain via Inverse Fast Fourier Transform
 processed_data = ifft(Compressed_Spectrum, N_fft, 1);
 
-% Pack metadata metrics for diagnostics
+% =========================================================================
+% 4. METADATA DIAGNOSTICS LOGGING
+% =========================================================================
 processing_metadata.gain_curve_dB = G_dB;
 processing_metadata.applied_linear_gains = gain_vector;
 processing_metadata.fft_points = N_fft;
