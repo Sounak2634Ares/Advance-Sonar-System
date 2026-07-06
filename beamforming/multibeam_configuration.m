@@ -55,12 +55,31 @@ steering_matrix = zeros( ...
                     array_elements, ...
                     num_beams);
 
+%% FIX:
+% Original phase term was exp(-1j*2*pi*element_positions'*sin(theta)),
+% which is only dimensionally correct if lambda = 1 m. It is not: at
+% config.fc this array's wavelength is lambda = sound_speed/fc, e.g.
+% 0.03 m at fc = 50 kHz, c = 1500 m/s. Without dividing by lambda the
+% phase argument is off by a factor of ~1/lambda (~33x here), so the
+% steering vectors alias many times over 2*pi and do not point where
+% beam_angles says they do. Added the missing 1/lambda factor so this
+% matches the physically-correct form in beamforming/steering_vector.m
+% (a_n(theta) = exp(-j*2*pi/lambda * d_n * sin(theta))).
+if isfield(config, 'sound_speed'), c_wave = config.sound_speed;
+elseif isfield(config, 'c'),       c_wave = config.c;
+else,                              c_wave = 1500; end
+
+if isfield(config, 'fc'), fc_wave = config.fc;
+else,                     fc_wave = 50000; end
+
+lambda = c_wave / fc_wave;
+
 for beam = 1:num_beams
 
     theta = deg2rad(beam_angles(beam));
 
     steering_matrix(:,beam) = ...
-        exp(-1j * 2*pi * ...
+        exp(-1j * (2*pi/lambda) * ...
         element_positions' * sin(theta));
 
 end
